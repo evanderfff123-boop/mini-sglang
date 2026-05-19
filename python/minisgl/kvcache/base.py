@@ -8,128 +8,129 @@ import torch
 
 
 class BaseKVCachePool(ABC):
-    """
-    Base class for key-value caches.
-    This class defines the interface for key-value caches used.
-    """
+    """KV缓存池的基类，定义了KV缓存的接口"""
 
     @abstractmethod
-    def k_cache(self, index: int) -> torch.Tensor: ...
+    def k_cache(self, index: int) -> torch.Tensor: ...  # 获取指定层的K缓存
 
     @abstractmethod
-    def v_cache(self, index: int) -> torch.Tensor: ...
+    def v_cache(self, index: int) -> torch.Tensor: ...  # 获取指定层的V缓存
 
     @abstractmethod
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
-    ) -> None: ...
+    ) -> None: ...  # 将KV存入指定位置
 
     @property
     @abstractmethod
-    def device(self) -> torch.device: ...
+    def device(self) -> torch.device: ...  # 缓存所在的设备
 
     @property
     @abstractmethod
-    def dtype(self) -> torch.dtype: ...
+    def dtype(self) -> torch.dtype: ...  # 缓存的数据类型
 
     @property
     @abstractmethod
-    def num_layers(self) -> int: ...
+    def num_layers(self) -> int: ...  # 缓存的层数
 
 
 @dataclass(frozen=True)
 class BaseCacheHandle(ABC):
-    cached_len: int
+    """缓存句柄的基类，记录已缓存的前缀长度"""
+    cached_len: int  # 已缓存的token长度
 
     @abstractmethod
-    def get_matched_indices(self) -> torch.Tensor: ...
+    def get_matched_indices(self) -> torch.Tensor: ...  # 获取匹配到的缓存索引
 
 
 class SizeInfo(NamedTuple):
-    evictable_size: int
-    protected_size: int
+    """缓存大小信息，记录可驱逐和受保护的大小"""
+    evictable_size: int  # 可被驱逐的缓存大小
+    protected_size: int  # 被保护（不可驱逐）的缓存大小
 
     @property
     def total_size(self) -> int:
-        return self.evictable_size + self.protected_size
+        return self.evictable_size + self.protected_size  # 总缓存大小 = 可驱逐 + 保护
 
 
 class InsertResult(NamedTuple):
-    cached_len: int  # length already in cache before insertion (should be freed)
-    handle: BaseCacheHandle  # cache handle for the inserted prefix
+    """插入缓存操作的结果"""
+    cached_len: int  # 插入前已在缓存中的长度（应被释放）
+    handle: BaseCacheHandle  # 已插入前缀的缓存句柄
 
 
 class MatchResult(NamedTuple):
-    cuda_handle: BaseCacheHandle
-    # TODO: support HiCache
+    """前缀匹配操作的结果"""
+    cuda_handle: BaseCacheHandle  # 匹配到的缓存句柄
 
 
 class BasePrefixCache(ABC):
+    """前缀缓存管理器的基类，负责前缀匹配、插入和驱逐"""
+
     @abstractmethod
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         """
-        Lock or unlock a cache handle.
-        This operation will not modify the cache, but change the size info only.
-        When a handle is locked, it cannot be evicted.
-        Handles must be locked before the previously-returned tensor of `match_prefix` is used.
-        Otherwise it may be evicted by calling evict.
+        锁定或解锁缓存句柄。
+        此操作不会修改缓存，只会改变大小信息。
+        句柄被锁定时，其对应的缓存不会被驱逐。
+        在使用 match_prefix 返回的张量之前，必须先锁定句柄，否则可能被 evict 回收。
 
         Args:
-            handle (BaseCacheHandle): The cache handle to lock or unlock.
-            unlock (bool): Whether to unlock the handle. Defaults to False.
+            handle: 要锁定或解锁的缓存句柄
+            unlock: 是否为解锁操作，默认为 False
         """
 
     @abstractmethod
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         """
-        Match prefix and return the indices of the matched prefix in the cache.
-        This operation will not modify the cache.
-        The returned indices is only safe to use when the handle is locked.
+        匹配前缀，返回缓存中已匹配的前缀索引。
+        此操作不会修改缓存。
+        只有在句柄被锁定后，返回的索引才能安全使用。
 
         Args:
-            input_ids (torch.Tensor): The input ids to match. Shape: (seq_len,)
+            input_ids: 输入的 token id 序列，形状为 (seq_len,)
         Returns:
-            MatchResult: The match result containing the cache handles.
+            MatchResult: 包含缓存句柄的匹配结果
         """
 
     @abstractmethod
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
         """
-        Insert a new prefix into the cache.
-        This operation will modify the cache.
+        将新的前缀插入缓存。
+        此操作会修改缓存。
         Args:
-            input_ids (torch.Tensor): The input ids to insert. Shape: (seq_len,)
-            indices (torch.Tensor): The indices to store the new prefix. Shape: (seq_len,)
+            input_ids: 要插入的 token id 序列，形状为 (seq_len,)
+            indices: 存储新前缀的位置索引，形状为 (seq_len,)
 
         Returns:
-            InsertResult: The result of the insertion.
+            InsertResult: 插入操作的结果
         """
 
     @abstractmethod
     def evict(self, size: int) -> torch.Tensor:
         """
-        Evict some prefixes from the cache to free up space.
-        This operation will modify the cache.
-        Note that evict 0 is always safe and does nothing.
-        Note that the actual evict size may be larger than the requested size.
+        从缓存中驱逐一些前缀以释放空间。
+        此操作会修改缓存。
+        注意：evict(0) 总是安全的，不执行任何操作。
+        实际驱逐的大小可能大于请求的大小。
         Args:
-            size (int): The size to evict.
+            size: 请求驱逐的大小
 
         Returns:
-            torch.Tensor: The indices evicted. Shape: (evict_size,)
+            torch.Tensor: 被驱逐的索引，形状为 (evict_size,)
         Raises:
-            RuntimeError: If the requested size is larger than the evictable size.
+            RuntimeError: 如果请求的大小大于可驱逐的大小
         """
 
     @abstractmethod
     def reset(self) -> None:
-        """Reset the cache manager and the underlying cache."""
+        """重置缓存管理器和底层缓存"""
 
     @property
     @abstractmethod
     def size_info(self) -> SizeInfo:
-        """Get the size information of the cache."""
+        """获取缓存的大小信息"""
 
     @abstractmethod
     def check_integrity(self) -> None:
-        """Check the integrity of the cache. Raise an error if the cache is corrupted."""
+        """检查缓存完整性，如果缓存损坏则抛出异常"""

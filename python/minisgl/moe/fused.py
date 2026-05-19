@@ -13,16 +13,18 @@ def fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """对门控输出执行 top-k 选择，返回权重和对应的专家 ID"""
     from sgl_kernel import topk_softmax
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, _ = hidden_states.shape
-    topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+    topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)  # top-k 权重
+    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)  # top-k 专家 ID
     topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
     if renormalize:
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)  # 重新归一化
     if num_token_non_padded is not None:
+        # 将填充 token 的 topk 专家设为 -1（无效）
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = -1
     return topk_weights, topk_ids
@@ -32,47 +34,37 @@ def moe_align_block_size(
     topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Aligns the token distribution across experts to be compatible with block
-    size for matrix multiplication.
+    调整 token 在专家间分布，使其与矩阵乘法的 block size 对齐。
 
-    Parameters:
-    - topk_ids: A tensor of shape [total_tokens, top_k] representing the
-        top-k expert indices for each token.
-    - block_size: The block size used in block matrix multiplication.
-    - num_experts: The total number of experts.
+    参数说明:
+    - topk_ids: shape [total_tokens, top_k]，每个 token 选中的 top-k 专家索引
+    - block_size: 块矩阵乘法的 block size
+    - num_experts: 总专家数
 
-    Returns:
-    - sorted_token_ids: A tensor containing the sorted token indices according
-        to their allocated expert.
-    - expert_ids: A tensor indicating the assigned expert index for each block.
-    - num_tokens_post_padded: The total number of tokens after padding,
-        ensuring divisibility by block_size.
+    返回:
+    - sorted_token_ids: 按专家排序后的 token 索引
+    - expert_ids: 每个 block 分配的专家索引
+    - num_tokens_post_padded: padding 后的总 token 数（能被 block_size 整除）
 
-    This function pads the number of tokens that each expert needs to process
-    so that it is divisible by block_size.
-    Padding ensures that during block matrix multiplication, the dimensions
-    align correctly.
+    该函数将每个专家需要处理的 token 数 padding 到 block_size 的整数倍。
+    Padding 确保块矩阵乘法的维度正确对齐。
 
-    Example:
-    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
-    block_size = 4, and num_experts = 4:
-    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
-        with each expert needing to process 3 tokens.
-    - As block_size is 4, we pad 1 token for each expert.
-    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
-    - Then append padding tokens [12, 12, 12, 12] for each block.
-    - After sorting by expert index, we obtain token_ids
-        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
-        Tokens 12 are non-existent (padding) and are ignored in
-        the subsequent matrix multiplication.
-    - The padding ensures that the total number of tokens is now divisible
-        by block_size for proper block matrix operations.
+    示例:
+    topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+    block_size = 4, num_experts = 4:
+    - 初始共 12 个 token（top_k 展开后），4 个专家各 3 个 token
+    - block_size 为 4，需要为每个专家 padding 1 个 token
+    - 先展平 topk_ids 为 [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3]
+    - 为每个 block 追加 padding token [12, 12, 12, 12]
+    - 按专家索引排序后得到 [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12]
+      token 12 是不存在的（padding），在后续矩阵乘法中忽略
+    - Padding 确保总 token 数能被 block_size 整除
     """
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)  # padding 后的最大 token 数
     sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
-    max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
+    max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)  # 最大 block 数
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
@@ -96,7 +88,7 @@ def get_default_config(
     K: int,
     topk: int,
 ) -> Dict[str, int]:
-
+    """获取 MoE 矩阵乘法的默认 Triton 配置（BLOCK_SIZE_M/N/K 和 GROUP_SIZE_M）"""
     config = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
@@ -104,6 +96,7 @@ def get_default_config(
         "GROUP_SIZE_M": 8,
     }
     if M <= E:
+        # token 数较少时使用更小的 block size
         config = {
             "BLOCK_SIZE_M": 16,
             "BLOCK_SIZE_N": 32,
@@ -119,7 +112,8 @@ def try_get_optimal_moe_config(
     top_k: int,
     M: int,
 ) -> Dict[str, int]:
-    E, _, N = w2_shape
+    """根据输入形状尝试获取最优的 MoE 配置"""
+    E, _, N = w2_shape  # E=专家数, N=隐藏维度
     config = get_default_config(M, E, N, w1_shape[2], top_k)
     return config
 
@@ -133,6 +127,7 @@ def fused_experts_impl(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
+    """融合 MoE 专家计算的核心实现（gate_proj + up_proj -> activation -> down_proj）"""
     from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
@@ -154,6 +149,7 @@ def fused_experts_impl(
     )
     config = get_config_func(M)
 
+    # 预分配中间缓存（避免重复分配）
     cache = torch.empty(
         M * topk_ids.shape[1] * max(N, w2.shape[1]),
         device=hidden_states.device,
@@ -161,15 +157,15 @@ def fused_experts_impl(
     )
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
-    )
+    )  # gate_proj + up_proj 融合后的中间结果
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N // 2),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
-    )
+    )  # 激活函数后的中间结果
     intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
         (M, topk_ids.shape[1], w2.shape[1]),
-    )
+    )  # down_proj 的输出
     compute_type = hidden_states.dtype
 
     out_hidden_states = hidden_states
@@ -185,10 +181,12 @@ def fused_experts_impl(
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
+    # 对齐 block size 以便矩阵乘法
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         curr_topk_ids, config["BLOCK_SIZE_M"], E
     )
 
+    # 第一步：gate_proj + up_proj 的融合计算（带路由权重）
     fused_moe_kernel_triton(
         curr_hidden_states,
         w1,
@@ -203,8 +201,10 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
     )
+    # 第二步：激活函数（SiLU 或 GELU）
     FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
     FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    # 第三步：down_proj 计算
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -220,6 +220,7 @@ def fused_experts_impl(
         compute_type=compute_type,
     )
 
+    # 第四步：对各专家的输出求和归约
     moe_sum_reduce_triton(
         intermediate_cache3,
         out_hidden_states[begin_token_idx:end_token_idx],
@@ -228,6 +229,8 @@ def fused_experts_impl(
 
 
 class FusedMoe(BaseMoeBackend):
+    """融合 MoE 后端的实现，使用 Triton kernel 执行高效计算"""
+
     def forward(
         self,
         hidden_states: torch.Tensor,

@@ -14,39 +14,49 @@ if TYPE_CHECKING:
 
 @dataclass
 class DistributedImpl(ABC):
-    @abstractmethod
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor: ...
+    """分布式通信策略的抽象基类"""
 
     @abstractmethod
-    def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """对所有卡上的张量执行 all-reduce 归约求和"""
+        ...
+
+    @abstractmethod
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        """将所有卡上的张量沿第0维拼接起来"""
+        ...
 
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
+    """基于 PyTorch torch.distributed 的通信实现"""
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = dist.get_world_size()
         if tp_size == 1:
-            return x
-        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+            return x  # 单卡时无需通信
+        dist.all_reduce(x, op=dist.ReduceOp.SUM)  # 多卡求和归约
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         tp_size = dist.get_world_size()
         if tp_size == 1:
-            return x
+            return x  # 单卡时直接返回
         shape = list(x.shape)
-        shape[0] = shape[0] * tp_size
+        shape[0] = shape[0] * tp_size  # 拼接后第0维扩大 tp_size 倍
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
-        dist.all_gather_into_tensor(out, x)
+        dist.all_gather_into_tensor(out, x)  # 收集所有卡的张量
         return out
 
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
-    comm: PyNCCLCommunicator
+    """基于 PyNCCL kernel 的高性能通信实现"""
+
+    comm: PyNCCLCommunicator  # PyNCCL 通信器实例
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        self.comm.all_reduce(x, "sum")
+        self.comm.all_reduce(x, "sum")  # 调用 PyNCCL kernel 做求和归约
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
@@ -54,19 +64,23 @@ class PyNCCLDistributedImpl(DistributedImpl):
 
         world_size = get_tp_info().size
         output_shape = list(x.shape)
-        output_shape[0] *= world_size
+        output_shape[0] *= world_size  # 输出张量的第0维扩大 world_size 倍
         result = x.new_empty(output_shape)
-        self.comm.all_gather(result, x)
+        self.comm.all_gather(result, x)  # 调用 PyNCCL kernel 做全收集
         return result
 
 
 class DistributedCommunicator:
-    plugins: List[DistributedImpl] = [TorchDistributedImpl()]
+    """分布式通信的统一入口，内部维护一个插件列表，默认使用 TorchDistributedImpl"""
+
+    plugins: List[DistributedImpl] = [TorchDistributedImpl()]  # 通信插件列表，默认用 PyTorch 实现
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """使用最近注册的插件执行 all-reduce"""
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        """使用最近注册的插件执行 all-gather"""
         return self.plugins[-1].all_gather(x)
 
 
@@ -74,10 +88,11 @@ def enable_pynccl_distributed(
     tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
 ) -> None:
     """
-    Enable PyNCCL-based distributed communication for tensor parallelism.
+    启用基于 PyNCCL 的分布式通信（用于张量并行）。
+    将 PyNCCL 实现追加到插件列表中，后续通信优先使用它。
     """
     if tp_info.size == 1:
-        return
+        return  # 单卡无需启用 PyNCCL
     from minisgl.kernel import init_pynccl
 
     comm = init_pynccl(
@@ -91,7 +106,5 @@ def enable_pynccl_distributed(
 
 
 def destroy_distributed() -> None:
-    """
-    Destroy all the distributed communication plugins.
-    """
+    """销毁所有已注册的分布式通信插件，清空插件列表"""
     DistributedCommunicator.plugins = []

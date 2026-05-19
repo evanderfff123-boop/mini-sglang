@@ -19,13 +19,15 @@ logger = init_logger(__name__)
 
 @dataclass
 class GraphCaptureBuffer:
-    input_ids: torch.Tensor
-    out_loc: torch.Tensor
-    positions: torch.Tensor
-    logits: torch.Tensor
+    """CUDA图捕获所需的缓冲区，存储input_ids、positions等输入输出tensor。"""
+    input_ids: torch.Tensor  # 输入token ID
+    out_loc: torch.Tensor  # 输出位置索引
+    positions: torch.Tensor  # 位置编码位置
+    logits: torch.Tensor  # 模型输出logits
 
     @classmethod
     def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+        """初始化指定batch size的CUDA图捕获缓冲区。"""
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -34,12 +36,14 @@ class GraphCaptureBuffer:
         )
 
     def set_batch(self, batch: Batch) -> None:
+        """将缓冲区的tensor切片设置到batch中，使模型前向时使用缓冲区内存。"""
         _slice = slice(batch.padded_size)
         batch.input_ids = self.input_ids[_slice]
         batch.out_loc = self.out_loc[_slice]
         batch.positions = self.positions[_slice]
 
     def copy_from(self, batch: Batch) -> None:
+        """将batch中的数据拷贝到缓冲区（在replay前准备输入数据）。"""
         _slice = slice(batch.padded_size)
         self.input_ids[_slice] = batch.input_ids
         self.out_loc[_slice] = batch.out_loc
@@ -51,6 +55,7 @@ def _determine_cuda_graph_bs(
     cuda_graph_max_bs: int | None,
     free_memory: int,
 ) -> List[int]:
+    """根据可用显存决定需要捕获CUDA图的batch size列表。"""
     if cuda_graph_bs is not None:
         return cuda_graph_bs
 
@@ -68,14 +73,18 @@ def _determine_cuda_graph_bs(
 
 
 def mem_GB(size: int) -> str:
+    """将字节数转换为GiB单位的可读字符串。"""
     return f"{size / (1024**3):.2f} GiB"
 
 
 def get_free_memory(device: torch.device) -> int:
+    """获取指定GPU设备的当前可用显存（字节）。"""
     return torch.cuda.mem_get_info(device)[0]
 
 
 class GraphRunner:
+    """CUDA图捕获和执行器，管理多个batch size的CUDA图。"""
+
     def __init__(
         self,
         stream: torch.cuda.Stream,
@@ -89,20 +98,22 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
     ) -> None:
+        """初始化GraphRunner：确定图batch size列表并触发CUDA图捕获。"""
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
         )
-        self.attn_backend = attn_backend
-        self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
-        self.graph_bs_list = sorted(cuda_graph_bs)
-        self.dummy_req = dummy_req
+        self.attn_backend = attn_backend  # attention后端，用于图和replay的准备
+        self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0  # 最大支持图的batch size
+        self.graph_bs_list = sorted(cuda_graph_bs)  # 按升序排列的图batch size列表
+        self.dummy_req = dummy_req  # 填充用的dummy请求
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
+        """捕获多个batch size的CUDA图，用于加速decode阶段的前向传播。"""
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
@@ -123,7 +134,7 @@ class GraphRunner:
             sorted(self.graph_bs_list, reverse=True),
             desc="Preparing for capturing CUDA graphs...",
             unit="batch",
-            disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
+            disable=not get_tp_info().is_primary(),  # 非主rank不显示进度条
         )
         pool = None
         for bs in pbar:
@@ -140,32 +151,36 @@ class GraphRunner:
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
             if pool is None:
-                pool = graph.pool()  # reuse cuda graph handle to reduce memory
+                pool = graph.pool()  # 复用CUDA图的内存池以减少总显存占用
             self.graph_map[bs] = graph
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
+        """判断当前batch是否可以使用CUDA图加速（仅decode阶段且batch size在支持范围内）。"""
         return batch.is_decode and batch.size <= self.max_graph_bs
 
     def replay(self, batch: Batch) -> torch.Tensor:
+        """回放CUDA图：将输入拷贝到缓冲区后执行预录制的CUDA图。"""
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
+        g = self.graph_map[batch.padded_size]  # 根据padded size选择对应batch size的图
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
-        padded_size = (  # choose the first available batch size
+        """将batch填充到CUDA图支持的最近batch size（使用dummy req填充）。"""
+        padded_size = (  # 选择第一个大于等于batch size的可用图batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)
             if self.can_use_cuda_graph(batch)
             else batch.size
         )
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
-    # NOTE: This must be called before freeing NCCL resources to prevent program hang
+    # 注意：必须在释放NCCL资源前调用，否则可能导致程序挂起
     def destroy_cuda_graphs(self) -> None:
+        """销毁CUDA图并触发垃圾回收。"""
         del self.graph_map
         gc.collect()

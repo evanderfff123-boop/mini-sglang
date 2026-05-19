@@ -13,53 +13,63 @@ from minisgl.utils import init_logger
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
-    server_host: str = "127.0.0.1"
-    server_port: int = 1919
-    num_tokenizer: int = 0
-    silent_output: bool = False
+    """服务器启动参数（继承自 SchedulerConfig，追加 HTTP 和进程相关配置）"""
+
+    server_host: str = "127.0.0.1"  # 服务器监听地址
+    server_port: int = 1919  # 服务器监听端口
+    num_tokenizer: int = 0  # 独立的 tokenizer 进程数（0 表示与 detokenizer 共用）
+    silent_output: bool = False  # 是否静默输出（shell 模式下启用）
 
     @property
     def share_tokenizer(self) -> bool:
+        """tokenizer 是否与 detokenizer 共用同一个进程"""
         return self.num_tokenizer == 0
 
     @property
     def zmq_frontend_addr(self) -> str:
+        """前端（FastAPI）与 detokenizer 通信的 ZMQ 地址"""
         return "ipc:///tmp/minisgl_3" + self._unique_suffix
 
     @property
     def zmq_tokenizer_addr(self) -> str:
+        """前端与 tokenizer 进程通信的 ZMQ 地址"""
         if self.share_tokenizer:
-            return self.zmq_detokenizer_addr
+            return self.zmq_detokenizer_addr  # 共用模式下复用 detokenizer 地址
         result = "ipc:///tmp/minisgl_4" + self._unique_suffix
         assert result != self.zmq_detokenizer_addr
         return result
 
     @property
     def tokenizer_create_addr(self) -> bool:
+        """tokenizer 进程是否需要绑定 ZMQ 地址"""
         return self.share_tokenizer
 
     @property
     def backend_create_detokenizer_link(self) -> bool:
+        """后端（scheduler）是否需要创建到 detokenizer 的链接"""
         return not self.share_tokenizer
 
     @property
     def frontend_create_tokenizer_link(self) -> bool:
+        """前端是否需要创建到 tokenizer 的 ZMQ 链接"""
         return not self.share_tokenizer
 
     @property
     def distributed_addr(self) -> str:
+        """分布式通信的 TCP 地址（用于进程组初始化）"""
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
 def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
     """
-    Parse command line arguments and return an EngineConfig.
+    解析命令行参数，返回 ServerArgs 配置对象和是否运行 shell 模式的标记。
 
     Args:
-        args: Command line arguments (e.g., sys.argv[1:])
+        args: 命令行参数列表（如 sys.argv[1:]）
+        run_shell: 是否强制运行 shell 模式
 
     Returns:
-        EngineConfig instance with parsed arguments
+        (ServerArgs 实例, 是否运行 shell 模式)
     """
     from minisgl.attention import validate_attn_backend
     from minisgl.kvcache import SUPPORTED_CACHE_MANAGER
@@ -223,18 +233,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
-    # Parse arguments
+    # 解析所有参数
     kwargs = parser.parse_args(args).__dict__.copy()
 
-    # resolve some arguments
+    # 解析并修正部分参数
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
-        kwargs["max_running_req"] = 1
-        kwargs["silent_output"] = True
+        kwargs["cuda_graph_max_bs"] = 1  # shell 模式下 CUDA graph 最大 batch 设为 1
+        kwargs["max_running_req"] = 1  # shell 模式最大并发请求数设为 1
+        kwargs["silent_output"] = True  # shell 模式下静默输出
 
     if kwargs["model_path"].startswith("~"):
-        kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+        kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])  # 展开 ~ 路径
 
     if kwargs["model_source"] == "modelscope":
         model_path = kwargs["model_path"]
@@ -251,7 +261,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     if (dtype_str := kwargs["dtype"]) == "auto":
         from minisgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype  # 从模型配置中自动推断 dtype
 
     DTYPE_MAP = {
         "float16": torch.float16,
@@ -259,7 +269,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
-    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
+    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])  # rank 0 表示主进程
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)

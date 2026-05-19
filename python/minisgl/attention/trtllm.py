@@ -15,66 +15,74 @@ if TYPE_CHECKING:
 
 @dataclass
 class TRTLLMCaptureData(BaseCaptureData):
+    """TensorRT-LLM 后端 CUDA Graph 捕获数据"""
     pass
 
 
 @dataclass
 class TRTLLMMetadata(BaseAttnMetadata):
-    cu_seqlens_k: torch.Tensor
-    cu_seqlens_q: torch.Tensor
-    cache_seqlens: torch.Tensor
-    max_seqlen_k: int
-    max_seqlen_q: int
+    """TensorRT-LLM 注意力计算所需的元数据"""
+    cu_seqlens_k: torch.Tensor  # K 侧累积序列长度（GPU）
+    cu_seqlens_q: torch.Tensor  # Q 侧累积序列长度（GPU）
+    cache_seqlens: torch.Tensor # 缓存中每个序列的长度（GPU）
+    max_seqlen_k: int           # K 侧最大序列长度
+    max_seqlen_q: int           # Q 侧最大序列长度
 
-    page_table: torch.Tensor
+    page_table: torch.Tensor    # 页表（GPU）
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
+        """获取每个序列最后一个 token 的索引"""
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
 
 class TensorRTLLMBackend(BaseAttnBackend):
+    """基于 TensorRT-LLM (FlashInfer TRTLLM API) 的注意力计算后端"""
+
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
-        self.config = config
-        self.kvcache = ctx.kv_cache
-        self.page_size = ctx.page_size
-        self.capture: TRTLLMCaptureData | None = None
-        self.max_graph_bs = 0
-        self.capture_bs: List[int] = []
-        self.scale = config.head_dim**-0.5
-        self.workspace_buffer = torch.empty(
+        self.config = config  # 模型配置
+        self.kvcache = ctx.kv_cache  # 全局 KV 缓存
+        self.page_size = ctx.page_size  # 页面大小
+        self.capture: TRTLLMCaptureData | None = None  # CUDA Graph 捕获数据
+        self.max_graph_bs = 0  # 最大 CUDA Graph batch size
+        self.capture_bs: List[int] = []  # 需要捕获的 batch size 列表
+        self.scale = config.head_dim**-0.5  # softmax 缩放因子
+        self.workspace_buffer = torch.empty(  # 工作空间缓冲区（128MB）
             128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
         )
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
+        """执行 TensorRT-LLM 注意力计算前向传播"""
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TRTLLMMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)  # 将当前 KV 存入缓存
+        kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))  # 获取层缓存
 
         if batch.is_prefill:
+            # prefill 阶段：使用 trtllm_batch_context_with_kv_cache
             return trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=metadata.page_table,
-                seq_lens=metadata.cache_seqlens,
-                max_q_len=metadata.max_seqlen_q,
-                max_kv_len=metadata.max_seqlen_k,
-                bmm1_scale=self.scale,
-                bmm2_scale=1.0,
-                cum_seq_lens_q=metadata.cu_seqlens_q,
-                cum_seq_lens_kv=metadata.cu_seqlens_k,
-                kv_layout="NHD",
-                batch_size=batch.size,
-                out_dtype=q.dtype,
+                workspace_buffer=self.workspace_buffer,  # 工作空间
+                block_tables=metadata.page_table,        # 块表（页表）
+                seq_lens=metadata.cache_seqlens,          # 序列长度
+                max_q_len=metadata.max_seqlen_q,          # Q 最大长度
+                max_kv_len=metadata.max_seqlen_k,         # KV 最大长度
+                bmm1_scale=self.scale,                    # 第一个 bmm 的缩放
+                bmm2_scale=1.0,                           # 第二个 bmm 的缩放
+                cum_seq_lens_q=metadata.cu_seqlens_q,     # Q 累积长度
+                cum_seq_lens_kv=metadata.cu_seqlens_k,    # KV 累积长度
+                kv_layout="NHD",                          # KV 缓存布局
+                batch_size=batch.size,                    # batch 大小
+                out_dtype=q.dtype,                        # 输出数据类型
             )
         else:
+            # decode 阶段：使用 trtllm_batch_decode_with_kv_cache
             return trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -89,36 +97,38 @@ class TensorRTLLMBackend(BaseAttnBackend):
             )
 
     def prepare_metadata(self, batch: Batch) -> None:
+        """为当前 batch 准备 TensorRT-LLM 所需的元数据"""
         reqs = batch.padded_reqs
 
-        padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
-        max_seqlen_k = max(seqlens_k)
-        max_seqlen_q = max(seqlens_q)
+        padded_size = len(reqs)  # padding 后的 batch 大小
+        seqlens_q = [req.extend_len for req in reqs]  # 每个请求的扩展长度
+        seqlens_k = [req.device_len for req in reqs]  # 每个请求在设备上的总长度
+        cached_lens = [req.cached_len for req in reqs]  # 每个请求已缓存的前缀长度
+        max_seqlen_k = max(seqlens_k)  # K 侧最大长度
+        max_seqlen_q = max(seqlens_q)  # Q 侧最大长度
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
         device = self.kvcache.device
         cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS)
-        cache_seqlens = cache_seqlens.to(device, non_blocking=True)
+        cache_seqlens = cache_seqlens.to(device, non_blocking=True)  # 异步复制到 GPU
         cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
         cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
 
         if max_seqlen_q == 1:
+            # decode 阶段：每个扩展长度为 1
             cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
-        elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
+        elif all(l == 0 for l in cached_lens):  # prefill 无缓存命中
             cu_seqlens_q = cu_seqlens_k
-        else:  # normal extend prefill, with partial cache hit
+        else:  # 普通 extend prefill 有部分缓存命中
             cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
+        new_page_table = torch.stack(  # 注意：全局页表以 page_size=1 为单位，需要根据实际 page_size 切片
             [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
         )
         if self.page_size > 1:
-            new_page_table.div_(self.page_size, rounding_mode="floor")
+            new_page_table.div_(self.page_size, rounding_mode="floor")  # 转换为实际 page 索引
         batch.attn_metadata = TRTLLMMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -129,6 +139,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+        """初始化 CUDA Graph 捕获所需的缓冲区"""
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
         capture = TRTLLMCaptureData.create(
@@ -139,6 +150,7 @@ class TensorRTLLMBackend(BaseAttnBackend):
         self.capture_bs = sorted(bs_list)
 
     def prepare_for_capture(self, batch: Batch) -> None:
+        """准备捕获 CUDA Graph：创建元数据并绑定到预分配缓冲区"""
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
         metadata = TRTLLMMetadata(
@@ -152,10 +164,11 @@ class TensorRTLLMBackend(BaseAttnBackend):
         batch.attn_metadata = metadata
 
     def prepare_for_replay(self, batch: Batch) -> None:
+        """准备重放 CUDA Graph：将当前元数据复制到已捕获的缓冲区中"""
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, TRTLLMMetadata)
         assert self.capture is not None and bs in self.capture_bs
-        # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
+        # cu_seqlens_q 对 decode 阶段始终为 [0, 1, 2, ..., bs]
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
