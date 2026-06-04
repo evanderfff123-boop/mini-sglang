@@ -94,18 +94,27 @@ class ZmqPullQueue(Generic[T]):
         self.context.term()
 
 
+# 定义异步 ZMQ PULL 队列类，继承自 Generic[T] 以支持类型参数化（泛型）
 class ZmqAsyncPullQueue(Generic[T]):
     """ZMQ PULL 异步队列（协程安全版本）"""
 
+    # 构造函数：初始化 ZMQ 异步上下文、套接字以及消息解码器
     def __init__(
         self,
+        # 接收一个字符串形式的 ZMQ 通信地址（可以是 ipc:// 或 tcp:// 协议等）
         addr: str,
+        # 接收一个布尔值，用于指明当前进程是负责绑定（bind）还是连接（connect）此通道
         create: bool,
+        # 接收一个可调用对象（解码器函数），用于将字典数据反序列化为特定类型 T 的对象
         decoder: Callable[[Dict], T],
     ):
+        # 创建一个支持 asyncio 的 PyZMQ 异步上下文对象，它是生成异步 Socket 的基石
         self.context = zmq.asyncio.Context()
+        # 在该异步上下文中创建一个 ZMQ PULL 类型的异步套接字，专门用于单向接收数据
         self.socket = self.context.socket(zmq.PULL)
+        # 根据 create 标志执行：若为 True 则调用 bind 绑定指定地址，若为 False 则调用 connect 连接指定地址
         self.socket.bind(addr) if create else self.socket.connect(addr)
+        # 将传入的解码回调函数保存至成员变量 self.decoder 中
         self.decoder = decoder
 
     async def get(self) -> T:

@@ -239,9 +239,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     # 解析并修正部分参数
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1  # shell 模式下 CUDA graph 最大 batch 设为 1
         kwargs["max_running_req"] = 1  # shell 模式最大并发请求数设为 1
-        kwargs["silent_output"] = True  # shell 模式下静默输出
+        # kwargs["silent_output"] = True  # shell 模式下静默输出
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])  # 展开 ~ 路径

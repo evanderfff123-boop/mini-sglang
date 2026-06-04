@@ -106,10 +106,12 @@ class ModelList(BaseModel):
     data: List[ModelCard] = Field(default_factory=list)  # 模型卡片列表
 
 
+# @dataclass 装饰器，自动为该类生成构造函数（__init__）、属性表示（__repr__）等样板代码
 @dataclass
 class FrontendManager:
     """前端管理器：管理用户请求的生命周期，包含 ZMQ 通信和事件映射"""
 
+    # 存储基础的服务器参数配置对象
     config: ServerArgs  # 服务器配置
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]  # 向 tokenizer 进程发送消息的队列
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]  # 从 tokenizer 进程接收消息的队列
@@ -118,12 +120,18 @@ class FrontendManager:
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)  # uid -> 已收到的回复列表
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)  # uid -> 用于等待新回复的事件
 
+    # 定义分配新用户/请求的方法，返回生成的唯一 uid
     def new_user(self) -> int:
         """为新请求分配一个唯一的 uid，并初始化对应的 ack_map 和 event_map"""
+        # 获取当前计数器对应的 uid 值
         uid = self.uid_counter
+        # 计数器累加 1，为下一次新用户请求做准备
         self.uid_counter += 1
+        # 在回复映射表中，为该 uid 创建一个空的回复列表
         self.ack_map[uid] = []
+        # 为该 uid 创建并关联一个新的 asyncio.Event 事件，用于挂起/唤醒流式等待协程
         self.event_map[uid] = asyncio.Event()
+        # 返回分配到的 uid
         return uid
 
     async def listen(self):
@@ -219,6 +227,7 @@ class FrontendManager:
             asyncio.create_task(self.abort_user(uid))  # 客户端断开后取消请求
             raise
 
+    # 异步处理取消和清理用户请求的逻辑
     async def abort_user(self, uid: int):
         """取消指定 uid 的请求：清理映射并发送 Abort 消息"""
         await asyncio.sleep(0.1)  # 等待可能的最后一批数据到达
@@ -228,10 +237,13 @@ class FrontendManager:
             del self.event_map[uid]
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
-
+    
+    # 关闭前端管理器连接并释放资源的方法
     def shutdown(self):
         """关闭所有 ZMQ 队列"""
+        # 停止用于发送数据到 tokenizer 的 ZMQ PUSH 连接
         self.send_tokenizer.stop()
+        # 停止用于接收来自 tokenizer 数据的 ZMQ PULL 连接
         self.recv_tokenizer.stop()
 
 
@@ -343,23 +355,37 @@ async def available_models():
     return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
 
+# 异步处理终端 Shell 模式补全请求的接口函数
 async def shell_completion(req: OpenAICompletionRequest):
     """交互式 Shell 的补全请求（使用 BackgroundTask 自动取消）"""
+    # 从全局环境中获取初始化好的 FrontendManager 实例（即控制连接与状态的 state 对象）
     state = get_global_state()
+    # 断言确保请求中存在消息列表（messages 字段不为 None），因为交互式 Shell 只支持多轮对话补全模式
     assert req.messages is not None, "Shell completion only supports chat-completions"
+    # 遍历请求中当前及历史的所有 Message 对象，调用其 model_dump() 将其转换为字典形式，构成提供给后端的 Prompt 上下文
     prompt = [msg.model_dump() for msg in req.messages]
 
     # TODO: 支持更多采样参数
+    # 调用状态管理器的 new_user() 方法，为当前轮次的对话请求分配一个独一无二的 uid，并初始化缓存映射
     uid = state.new_user()
+    # 异步通过 ZMQ 发送队列投递一条 TokenizeMsg 消息，驱动后端的 tokenizer 和推理调度器工作
     await state.send_one(
         TokenizeMsg(
+            # 携带分配给当前请求的唯一标识 uid
             uid=uid,
+            # 将刚刚整理、序列化好的对话历史和新提示词（prompt 列表）作为输入内容传给后端
             text=prompt,
+             # 构造并配置模型推理时的采样参数
             sampling_params=SamplingParams(
+                # 是否忽略结束符（EOS）
                 ignore_eos=req.ignore_eos,
+                # 设定单次生成的最大 Token 数量限制
                 max_tokens=req.max_tokens,
+                # 设置采样温度值，控制生成文本的多样性与发散程度
                 temperature=req.temperature,
+                # 设定 Top-K 采样参数
                 top_k=req.top_k,
+                # 设定 Top-P 采样参数
                 top_p=req.top_p,
             ),
         )
@@ -375,65 +401,112 @@ async def shell_completion(req: OpenAICompletionRequest):
     )
 
 
-
+# 定义用于命令行交互式 shell 的异步函数，作为除 Web 模式之外的轻量终端测试环境
 async def shell():
     """交互式命令行 Shell：支持 /exit 退出和 /reset 重置对话历史"""
+    # 预设在交互提示符中可以支持的控制指令列表
     commands = ["/exit", "/reset"]
+     # 使用 prompt_toolkit 提供的 WordCompleter 对指令列表进行封装，以便输入时提供补全建议
     completer = WordCompleter(commands)
+    # 创建交互式话路 Session，设置提示符前缀为 "$ "，并将补全器注入其中
     session = PromptSession("$ ", completer=completer)
 
+    # 尝试进入命令读取和处理逻辑，防止由于强行终止产生崩溃
     try:
+        # 初始化一个元组列表，用于维护和累积当前会话下的多轮对话历史（[(用户输入, 模型回答)]）
         history: List[Tuple[str, str]] = []  # 对话历史（user_msg, assistant_msg）
+        # 开启交互主循环，直至遇到退出信号
         while True:
+            # 异步挂起并等待用户在终端输入内容，读取后自动剥离首尾的多余空白字符
             cmd = (await session.prompt_async()).strip()
+            # 如果输入内容为空
             if cmd == "":
                 continue
+             # 判断输入的文本是否以斜杠 "/" 开头，如果是，说明这是一条系统控制指令
             if cmd.startswith("/"):
+                # 如果控制指令是 "/exit"
                 if cmd == "/exit":
                     return
+                # 如果控制指令是 "/reset"
                 if cmd == "/reset":
+                    # 重置对话历史，将列表清空
                     history = []  # 清空对话历史
                     continue
+                # 如果输入的是其他不认识的斜杠指令，则抛出值错误异常
                 raise ValueError(f"Unknown command: {cmd}")
+            # 初始化一个列表，用于存放组装好的、符合 API 格式的多轮对话消息对象
             history_messages: List[Message] = []
+            # 遍历此前记录的历史对话数组，将多轮问答拆解为单独的消息对象
+            # 每轮都想要重新append一下
             for user_msg, assistant_msg in history:
+                # 构建代表用户的历史消息对象并追加至消息列表
                 history_messages.append(Message(role="user", content=user_msg))
+                # 构建代表模型助手的历史消息对象并追加至消息列表
                 history_messages.append(Message(role="assistant", content=assistant_msg))
-            # 将当前消息和历史一起发送给服务器
+            # 构建一个发送给推理服务器的 OpenAI 兼容补全请求对象
             req = OpenAICompletionRequest(
+                # model 字段置空，本地单模型服务环境下一般无需显式指定具体模型名称
                 model="",
+                # 将前面整合的所有历史多轮对话消息，与用户当前键入的 cmd 合并为最终的消息列表
                 messages=history_messages + [Message(role="user", content=cmd)],
+                # 从系统环境变量中读取并填充最大 Token 生成限制
                 max_tokens=ENV.SHELL_MAX_TOKENS.value,
+                # 从系统环境变量中读取并填充 top_k 采样过滤参数
                 top_k=ENV.SHELL_TOP_K.value,
+                # 从系统环境变量中读取并填充 top_p 采样过滤参数
                 top_p=ENV.SHELL_TOP_P.value,
+                # 从系统环境变量中读取并填充采样温度值参数
                 temperature=ENV.SHELL_TEMPERATURE.value,
+                # 设置为流式生成，以便本地终端能够逐字打印模型的实时产出
                 stream=True,
             )
+            # 初始化一个字符串，用于暂存并累加当前这次对话收到的全部模型增量回复
             cur_msg = ""
+            # 调用本地的 shell_completion 接口发送请求，并异步遍历返回数据包迭代器（body_iterator）
             async for chunk in (await shell_completion(req)).body_iterator:
+                # 将接收到的二进制消息数据块解码为 Python 字符串
                 msg = chunk.decode()  # type: ignore
+                # 断言当前的数据块必须以 "data: " 前缀开头，验证其是否符合 SSE 规范
                 assert msg.startswith("data: "), msg
+                # 剥离前缀 "data: "（即切片去除前 6 个字符），得到实际的有效载荷字符串
                 msg = msg[6:]  # 去掉 "data: " 前缀
+                # 断言剥离前缀后的载荷文本是否是以换行符 "\n" 结尾
                 assert msg.endswith("\n"), msg
                 msg = msg[:-1]  # 去掉末尾换行
+                # 如果接收到的有效载荷是流式完成标志 "[DONE]"
                 if msg == "[DONE]":
+                    # 说明模型已完成生成，跳过打印并等待数据流自然闭合
                     continue
+                # 将每次解包出的一小段增量文本累加到 cur_msg 中
                 cur_msg += msg
+                # 立即向控制台打印这一段文字，end="" 避免自动换行，flush=True 强制刷写输出缓冲区以防延迟
                 print(msg, end="", flush=True)
+            # 整个流式推理结果输出完毕后，打印一个换行符并刷新终端显示
             print("", flush=True)
+            # 将本次用户的提问与完整的模型增量应答作为二元组存入历史记录，以便下轮对话检索
             history.append((cmd, cur_msg))  # 保存到历史记录
+    # 捕获 EOFError 异常，通常对应用户在终端交互中按下了 Ctrl-D
     except EOFError:
         # 用户按下了 Ctrl-D
+        # 捕获后直接略过，进入后面的回收流程
         pass
+    # 退出交互时必须调用的资源清理块
     finally:
+        # 向终端打印提示信息，告知用户正在退出命令行 Shell 界面
         print("Exiting shell...")
+        # 异步睡眠 0.1 秒，等待后台一些未尽的文件或套接字操作进行平滑收尾
         await asyncio.sleep(0.1)
+        # 获取前端管理的全局状态对象，并主动调用其 shutdown 方法，安全中断 ZMQ 消息队列的收发连接
         get_global_state().shutdown()
         # 然后杀掉所有子进程
+        # 导入系统与进程辅助控制库 psutil，用于管理底层的进程拓扑树
         import psutil
 
+        # 获取当前的父进程对象（即运行当前 python api 服务的进程实例）
         parent = psutil.Process()
+        # 递归遍历并检索当前进程下属的所有还在活跃的子进程（例如 tokenizer 进程或调度器工作进程）
         for child in parent.children(recursive=True):
+            # 强制杀掉相关的子进程，从源头上杜绝孤儿进程对系统计算资源或端口的残留占用
             child.kill()
 
 
@@ -446,35 +519,57 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         start_backend: 启动后端工作进程（TP scheduler + tokenizer/detokenizer）的回调函数。
         run_shell: 如果为 True，则运行交互式终端 Shell 而非启动 uvicorn。
     """
+    # ZMQ: 进程间收发信息的库，比TCP Socket简单，比管道灵活
 
+    # 声明使用全局变量 _GLOBAL_STATE，以便在函数内对其进行修改与赋值
     global _GLOBAL_STATE
 
+    # 判断是否需要运行交互式终端 Shell
     if run_shell:
+        # 在 Shell 模式下，断言配置中不能使用虚拟权重（dummy weights），若使用了则抛出异常
         assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
 
+    # 从配置对象中读取服务器需要绑定的主机 IP 地址
     host = config.server_host
+     # 从配置对象中读取服务器需要监听的端口号
     port = config.server_port
 
+    # 断言全局状态 _GLOBAL_STATE 此时必须为 None，确保它没有被重复初始化
     assert _GLOBAL_STATE is None, "Global state is already initialized"
+    # 实例化 FrontendManager，并将其赋值给全局变量 _GLOBAL_STATE，用于管理前端状态与连接
     _GLOBAL_STATE = FrontendManager(
+        # 将配置参数传递给 FrontendManager 实例
         config=config,
+        # 创建一个用于接收来自 tokenizer 消息的异步 PULL 队列
         recv_tokenizer=ZmqAsyncPullQueue(
+            # 使用配置中定义的前端 ZMQ 接收地址
             config.zmq_frontend_addr,
+            # 设置为 True，表示前端进程是第一个绑定（bind）该地址的进程，负责创建该通信通道
             create=True,  # 前端是第一个绑定该地址的进程
+            # 传入解码器，用于将接收到的原始二进制字节数据反序列化为前端消息对象
             decoder=BaseFrontendMsg.decoder,
         ),
+        # 创建一个用于发送消息给 tokenizer 的异步 PUSH 队列
         send_tokenizer=ZmqAsyncPushQueue(
+            # 使用配置中定义的 tokenizer ZMQ 发送地址
             config.zmq_tokenizer_addr,
+            # 根据配置决定是由前端进程创建（bind）还是仅仅连接（connect）到此 ZMQ 通道
             create=config.frontend_create_tokenizer_link,  # 根据配置决定是否创建 ZMQ 绑定
+            # 传入编码器，用于将要发送的消息对象序列化为二进制字节数据
             encoder=BaseTokenizerMsg.encoder,
         ),
     )
 
-    # 在此处启动后端进程
+    # 在此处调用回调函数，启动后端工作进程（包括 TP 调度器和 tokenizer/detokenizer）
     start_backend()
 
+    # 输出日志，提示 API 服务器已准备就绪，并展示具体的主机和端口号
     logger.info(f"API server is ready to serve on {host}:{port}")
+    # 判断当前是否不需要运行终端 Shell 模式
     if not run_shell:
+        # 启动 uvicorn 异步 Web 服务器，运行 app 应用，并监听指定的主机地址和端口
         uvicorn.run(app, host=host, port=port)
+    # 如果需要运行终端 Shell 模式
     else:
+        # 使用 asyncio 运行异步的交互式 shell 函数
         asyncio.run(shell())
