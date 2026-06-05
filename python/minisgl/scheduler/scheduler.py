@@ -207,8 +207,11 @@ class Scheduler(SchedulerIOMixin):
         """处理上一轮前向传播的输出（detokenize、释放资源、缓存等）。"""
         if last_data is None:
             return
-
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        if batch.is_decode:
+            self._decode_count = getattr(self, '_decode_count', 0) + 1
+        else:
+            print(f"[RESULT] Prefill done, moving req to decode manager")
         copy_done.synchronize()  # 等待 CPU 拷贝完成
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -233,6 +236,8 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False)  # 缓存 prefill 结果
 
         self.finished_reqs = new_finished_reqs
+        if new_finished_reqs:
+            print(f"[DONE]  Request finished after {self._decode_count} decode steps")
         self.send_result(reply)  # 发送 detokenize 结果给前端
 
     # --- 消息处理 ---
@@ -251,6 +256,10 @@ class Scheduler(SchedulerIOMixin):
             raise KeyboardInterrupt 
         # 判断消息类型是否为新进来的用户推理请求消息（UserMsg）
         elif isinstance(msg, UserMsg):
+            print(f"\n{'='*60}")
+            print(f"[STATE] NEW REQUEST: uid={msg.uid}, input_len={len(msg.input_ids)}")
+            print(f"[STATE]   → Entering PREFILL queue ({len(self.prefill_manager.pending_list)} pending)")
+            print(f"{'='*60}\n")
             # 仅在主进程（Rank 0）上打印调试日志，记录收到用户消息的详细信息
             logger.debug_rank0("Received user msg: %s", msg)
             # 获取用户输入 prompt 的 Token 序列长度，以及当前推理引擎能支持的最大序列长度
@@ -327,6 +336,9 @@ class Scheduler(SchedulerIOMixin):
             # 如果本轮没有符合条件的 Prefill 请求，则顺延调度处于 Decode 管理器中的就绪请求
             or self.decode_manager.schedule_next_batch()
         )
+        if batch and batch.is_prefill:
+            print(f"[BATCH] ★ PREFILL: {len(batch.reqs)} requests, "
+                  f"pending={len(self.prefill_manager.pending_list)}")
         # 如果成功组合出了待推理的批次对象，则调用 _prepare_batch 进行页表和张量打包并返回，否则返回 None
         return self._prepare_batch(batch) if batch else None
 
@@ -336,6 +348,11 @@ class Scheduler(SchedulerIOMixin):
         """执行一次前向传播：读取 token 池 -> 模型推理 -> 写回 token 池。"""
         # 解构输入包，分别提取当前批次对象、采样超参数、输入内存映射索引和输出内存映射索引
         batch, sample_args, input_mapping, output_mapping = forward_input
+        self._decode_count = getattr(self, '_decode_count', 0)
+        if batch.is_prefill:
+            n_tokens = sum(r.extend_len for r in batch.padded_reqs)
+            print(f"\n[PREFILL] {batch.size} reqs, {n_tokens} tokens → entering DECODE phase")
+            self._decode_count = 0
         # 通过输入索引映射，从物理 Token 池中精准提取本轮推理所需的全部 Token ID
         batch.input_ids = self.token_pool[input_mapping]
         # 调用底层推理引擎的 forward_batch 方法，驱动模型在 GPU 上进行前向计算和 Token 采样
