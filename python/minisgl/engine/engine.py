@@ -26,92 +26,151 @@ class ForwardOutput(NamedTuple):
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
 
-
+# 定义推理引擎核心类，用于执行模型推理相关的高性能计算任务
 class Engine:
     """推理引擎核心类，负责模型加载、KV cache管理、前向传播和采样。"""
 
+    # 初始化方法，接收一个 EngineConfig 配置对象
     def __init__(self, config: EngineConfig):
         """初始化引擎：设置设备、分布式通信、模型、KV cache、采样器和CUDA图捕获。"""
+        # 断言确保在此之前 PyTorch 的 CUDA 运行时尚未初始化，防止多进程进程组初始化产生冲突
         assert not torch.cuda.is_initialized()
+        # 初始化和注册张量并行（Tensor Parallelism）的 Rank 与总大小信息到全局
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        # 调用辅助函数微调或修正配置项中的具体参数
         _adjust_config(config)
 
         # --- 设备与CUDA流初始化 ---
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")  # 当前rank对应的GPU设备
-        torch.cuda.set_device(self.device)  # 将当前进程绑定到指定GPU
-        torch.manual_seed(42)  # 固定随机种子，保证可复现性
-        self.stream = torch.cuda.Stream()  # 独立的CUDA流，用于异步执行
-        torch.cuda.set_stream(self.stream)  # 将默认流设为自定义流
-        self.dtype = config.dtype  # 模型权重和计算的数据类型
-        self.ctx = Context(config.page_size)  # 全局上下文，管理KV cache和page table
+        # 根据当前进程所处的 TP rank 号，构造对应的 GPU 设备对象
+        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        # 将当前的 PyTorch CUDA 上下文绑定到指定的 GPU 设备上
+        torch.cuda.set_device(self.device)
+        # 设定 PyTorch 随机数生成器的种子，保障后续随机抽样等逻辑的一致性与可复现性
+        torch.manual_seed(42)
+        # 创建一个独立的 CUDA 流（CUDA Stream），用于后续的前向传播异步执行
+        self.stream = torch.cuda.Stream()
+        # 将当前线程的默认工作 CUDA 流切换为刚才创建的自定义流
+        torch.cuda.set_stream(self.stream)
+        # 保存并记录执行推理和模型权重所使用的数据精度（如 FP16 或 BF16）
+        self.dtype = config.dtype
+        # 实例化全局上下文管理对象，设定单页的大小
+        self.ctx = Context(config.page_size)
+        # 将当前创建的上下文设置为本轮执行的全局上下文
         set_global_ctx(self.ctx)
 
         # --- 分布式通信初始化 ---
-        self.tp_cpu_group = self._init_communication(config)  # TP组内的CPU通信组（gloo后端）
+        # 初始化张量并行（TP）在分布式环境中的 CPU 通信进程组（通常采用 gloo 后端实现基础握手与内存对齐）
+        self.tp_cpu_group = self._init_communication(config)
+        # 同步各 rank 进程并获取当前可用（空闲）的物理显存容量大小
         init_free_memory = self._sync_get_memory()[1]
+        # 仅让主 rank（Rank 0）在日志中打印模型加载前的空闲显存（转换为 GB 单位）
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # --- 模型初始化（先创建meta设备上的骨架，再加载权重）---
+        # 将旋转位置编码（RoPE）对应的元操作绑定到当前的物理 GPU 设备上
         set_rope_device(self.device)
+        # 在 meta（元）设备以及指定的数据精度下运行，以避免在声明参数时开辟实际物理内存
         with torch.device("meta"), torch_dtype(config.dtype):
+            # 根据模型架构配置，创建未加载权重的模型骨架
             self.model = create_model(config.model_config)
+        # 从本地加载模型权重状态字典，并将其拷贝填充到构建好的模型实例中（此时实际占用显存）
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # --- KV cache池初始化 ---
-        self.num_pages = self._determine_num_pages(init_free_memory, config)  # 计算可用KV cache页数
+        # 结合配置及除去模型加载后剩下的可用显存，计算当前环境可容纳的最大 KV 缓存物理页数
+        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        # 根据计算得出的总页数和单页容量，换算出能够存储的最大 Token 总数
         num_tokens = self.num_pages * config.page_size
+        # 创建 KV Cache 物理内存池，将其绑定至全局上下文以及本类属性中
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+            # 传入模型参数配置以获得每层维度和 Attention 头数量
             model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 用于dummy page（占位页）
+            # 总分配页数在基础页数上加 1，该额外空间用作 dummy page（占位或异常回退页）
+            num_pages=self.num_pages + 1,
+            # 指定单页存放 Token 的数量
             page_size=config.page_size,
+            # 指定分配该显存池的物理目标 GPU 设备
             device=self.device,
+            # 指定显存池的数据存储精度
             dtype=self.dtype,
         )
 
         # --- page table（页表）初始化 ---
         # 注意：1. 保证128字节对齐（便于GPU高效访问）；2. 存储的是原始位置而非页号
+        # 将推理支持的最大序列长度，限制在用户配置值和物理缓存实际总承载量的最小值内
         self.max_seq_len = min(config.max_seq_len, num_tokens)  # 取配置值和KV cache容量中的较小值
+        # 将最大序列长度向上舍入至 32 的倍数，以便满足 GPU 内存指令的对齐边界
         aligned_max_seq_len = _align_up_32(self.max_seq_len)
+        # 在显存上创建二维页表张量，初始化为 0。多开辟 1 行空间供占位请求（dummy request）使用
         self.ctx.page_table = self.page_table = torch.zeros(  # +1 用于dummy request（占位请求）
+            # 页表尺寸设计为：(最大运行并发数 + 1, 向上对齐的最大序列长度)
             (config.max_running_req + 1, aligned_max_seq_len),
+            # 页表中存储物理位置偏移索引，采用 32 位有符号整数
             dtype=torch.int32,
+            # 将页表分配至当前 GPU 设备上
             device=self.device,
         )
 
         # --- Attention和MoE后端初始化 ---
+        # 根据底层注意力计算架构及模型配置，初始化 Attention 执行后端（如 FlashAttention 等算子库）
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        # 检查模型是否属于混合专家（MoE）架构
         if config.model_config.is_moe:
+            # 如果是 MoE 模型，初始化指定的专家路由及计算后端，并注册至全局上下文
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # --- 采样器初始化 ---
+        # 实例化采样器（Sampler）对象，用于接收 logits，并按温度、核采样或 TopK 采样逻辑输出 Token
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
+        # 再次执行同步并检测系统在完成所有对象初始化后的剩余空闲显存大小
         post_free_memory = self._sync_get_memory()[0]
+        # 仅由 Rank 0 进程打印出最终初始化完毕后的系统可用空闲显存（以 GB 为单位）
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # --- CUDA图捕获初始化 ---
+        # 实例化一个专为 CUDA Graph 静态执行准备的哑请求（dummy request）实例
         self.dummy_req = Req(
+            # 在 CPU 上分配一个只包含单 Token（例如 [0]）的张量作为占位输入
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
-            table_idx=config.max_running_req,  # 使用最后一个槽位作为dummy request的索引
+            # 使用最大槽位索引作为该哑请求在页表中的定位行索引
+            table_idx=config.max_running_req,
+            # 设定当前已缓存 Token 长度为 0
             cached_len=0,
+            # 设定本次解码的目标输出 Token 长度为 1
             output_len=1,
+            # 设置该请求的唯一标识（UID）为 -1，表示其仅为系统内部占位符
             uid=-1,
+            # 将采样参数设置为空
             sampling_params=None,  # type: ignore
+            # 将缓存控制句柄设置为空
             cache_handle=None,  # type: ignore
         )
-        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # 将dummy request的页表项指向dummy page
+        # 将页表中哑请求所在的行全部填充为物理 Token 池的虚拟上限位置（即 dummy page 的起始绝对偏移）
+        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
+        # 创建 CUDA 图（CUDA Graphs）管理器实例，用以录制并快速回放特定 batch size 的 GPU 执行指令
         self.graph_runner = GraphRunner(
+            # 传入用于捕获与执行的自定义 CUDA 流
             stream=self.stream,
+            # 传入绑定的 GPU 设备
             device=self.device,
+            # 传入已加载参数的模型实例
             model=self.model,
+            # 传入绑定的注意力计算后端
             attn_backend=self.attn_backend,
+            # 传入捕获 CUDA Graph 所依据的 Batch Size 列表
             cuda_graph_bs=config.cuda_graph_bs,
+            # 传入 CUDA Graph 机制所能支持的最大 Batch Size 上限
             cuda_graph_max_bs=config.cuda_graph_max_bs,
+            # 传入初始可用显存以确保图捕获能申请到足量的静态工作缓存（Workspace）
             free_memory=init_free_memory,
+            # 传入向上对齐后的最大序列长度
             max_seq_len=aligned_max_seq_len,
+            # 传入模型的总词表大小
             vocab_size=config.model_config.vocab_size,
+            # 传入刚刚初始化的哑请求对象，用于录制过程中的输入对齐与静态页表占位
             dummy_req=self.dummy_req,
         )
 

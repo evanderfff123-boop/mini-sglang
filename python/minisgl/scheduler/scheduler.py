@@ -43,38 +43,61 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+# 定义 Scheduler 类，继承自处理输入输出交互的 SchedulerIOMixin 基类
 class Scheduler(SchedulerIOMixin):
     """主调度器：管理 prefill/decode 调度、消息处理、重叠执行。"""
 
+    # 初始化方法，接收一个 SchedulerConfig 配置对象
     def __init__(self, config: SchedulerConfig):
+        # 局部导入 Engine 类，避免在文件顶部导入可能引起的循环引用
         from minisgl.engine import Engine
 
+        # 实例化底层执行引擎，该引擎负责模型前向传播、注意力机制后端及采样器等核心计算
         self.engine = Engine(config)  # 底层引擎，包含模型、注意力后端、采样器等
 
+        # 使用另一个 CUDA 流，以便将元数据/调度相关的处理与底层的 GPU 计算进行重叠（Overlap）
+        # 获取底层引擎所使用的 GPU 设备
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device  # GPU 设备
+        # 创建一个专用于当前调度器任务的 PyTorch CUDA 流
         self.stream = torch.cuda.Stream(device=self.device)  # 调度器专用 CUDA 流
+        # 获取底层引擎 CUDA 流的上下文管理器，以便在需要时切换到引擎流
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)  # 引擎 CUDA 流的上下文管理器
+        # 将当前线程的默认 CUDA 流设置为调度器专用的 stream，使后续操作默认在该流上发射
         torch.cuda.set_stream(self.stream)
 
+        # 初始化其他辅助管理组件
+        # 实例化表管理器，用于维护最大运行请求数以及引擎物理页表的映射关系
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)  # 行表管理器
+        # 实例化缓存管理器，负责管理物理页分配、释放、逐出以及前缀缓存（Prefix Caching）
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
         )  # 缓存管理器（页面分配/逐出/前缀缓存）
+        # 实例化解码管理器，用于维护和处理处于 Decode 阶段的请求信息
         self.decode_manager = DecodeManager(config.page_size)  # Decode 管理器
+        # 实例化预填充管理器，协调缓存、表映射以及解码器来实现 Prefill 阶段的管理
         self.prefill_manager = PrefillManager(
+            # 传入缓存管理器、表管理器和解码管理器作为其协同工作的依赖
             self.cache_manager, self.table_manager, self.decode_manager
         )  # Prefill 管理器
 
+        # 定义一些常用变量的引用或别名，以便于后续逻辑快速访问
+        # 初始化一个集合，用于记录当前调度轮次中已经执行完毕的请求对象
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()  # 本轮已完成的请求集合
+        # 根据配置中的模型路径加载对应的分词器（Tokenizer）
         self.tokenizer = load_tokenizer(config.model_path)  # tokenizer
+        # 获取并保存分词器的结束符 Token ID，用于判断生成序列是否结束
         self.eos_token_id = self.tokenizer.eos_token_id  # EOS token ID
+        # 创建对表管理器中 Token 池的引用，便于直接进行 Token 数据的存取
         self.token_pool = self.table_manager.token_pool  # token 池（快捷引用）
+        # 设定单次 Prefill 调度能容纳的最大新 Token 预算限制
         self.prefill_budget = config.max_extend_tokens  # 每批 prefill 的最大 token 预算
         # self.config = config
 
+        # 初始化 I/O 混入（Mixin）父类
+        # 调用父类 SchedulerIOMixin 的初始化方法，传入配置对象和引擎的张量并行（TP）CPU 通信组
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
