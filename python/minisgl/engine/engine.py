@@ -258,21 +258,44 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        """对一个batch执行前向传播，返回下一步的token（GPU和CPU各一份）。"""
+        """对一个 batch 执行前向传播，并返回下一步预测的 token（分别保存在 GPU 和 CPU 上）。
+        
+        参数:
+            batch (Batch): 当前待处理的批数据，包含请求信息和状态。
+            args (BatchSamplingArgs): 采样参数（如 Temperature, Top-P 等）。
+            
+        返回:
+            ForwardOutput: 包含 GPU 上的 token、CPU 上的 token 以及用于同步的 CUDA 事件。
+        """
+        # 验证当前活跃的 CUDA 流是否为该实例专用的工作流(self.stream)
+        # 确保所有 CUDA 算子都在指定的流中串行执行，避免多流并发导致数据竞争
         assert torch.cuda.current_stream() == self.stream
+        # 使用上下文管理器准备前向传播所需的环境（例如设置位置编码、KV Cache 寻址元数据等）
         with self.ctx.forward_batch(batch):
+            # 判断当前 batch 的形状和状态是否满足使用 CUDA Graph 的条件
+            # CUDA Graph 能够将静态拓扑的 GPU 算子打包，消除 CPU 提交任务的开销，常用于 Decode 阶段
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)  # 使用CUDA图加速decode阶段
             else:
-                logits = self.model.forward()
+                logits = self.model.forward() # 常规前向传播（如 Prefill 阶段，或形状动态变化时）
 
         for req in batch.reqs:
-            req.complete_one()  # 每个请求的已完成token数+1
+            req.complete_one()  # 将每个请求已生成的 token 计数器加 1
 
+        # 1. 提取有效 batch 大小内的 Logits 并进行采样，获取预测的 Token ID
+        # 2. 将 Token ID 的数据类型统一转换为 int32，保持在 GPU 上
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)  # 异步拷贝到CPU，供调度器使用
+        # 将生成的 Token 从 GPU 异步拷贝到 CPU
+        # non_blocking=True 允许 CPU 线程不等待拷贝完成而直接向下执行，实现 CPU-GPU 流水线并行
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        # 创建一个 CUDA 事件，用于后续跟踪异步拷贝任务的完成状态
         copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)  # 记录拷贝完成事件，用于同步
+        # 在当前 CUDA 工作流中记录（Record）该事件
+        # 当 GPU 执行完 record 之前的所有任务（包括采样和数据拷贝）时，该事件会被标记为已完成
+        copy_done_event.record(self.stream)
+        # 返回打包好的前向传播结果。
+        # 外部调度器（运行在 CPU 上）可以在必要时通过 copy_done_event.synchronize() 
+        # 或 event.query() 来安全地读取 next_tokens_cpu，从而避免提前访问导致数据未准备就绪
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:

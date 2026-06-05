@@ -239,8 +239,7 @@ class Scheduler(SchedulerIOMixin):
         if new_finished_reqs:
             print(f"[DONE]  Request finished after {self._decode_count} decode steps")
         self.send_result(reply)  # 发送 detokenize 结果给前端
-
-    # --- 消息处理 ---
+    
     # 定义内部方法 _process_one_msg，用于分发和处理单个后台传入的消息对象
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         """处理单个后端消息（用户请求、中止、退出等）。"""
@@ -329,7 +328,6 @@ class Scheduler(SchedulerIOMixin):
     # 定义内部方法 _schedule_next_batch，用于生成下一个要在 GPU 上执行的批次输入，可返回 ForwardInput 或 Non
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        # 待办事项：未来支持其他的调度策略，例如优先调度已经处于 DECODE 状态下的请求
         batch = (
             # 默认优先调度 Prefill 管理器中的请求，并限制单次计算的最大 Token 预算
             self.prefill_manager.schedule_next_batch(self.prefill_budget)

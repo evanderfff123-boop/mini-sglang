@@ -83,7 +83,9 @@ def get_free_memory(device: torch.device) -> int:
 
 
 class GraphRunner:
-    """CUDA图捕获和执行器，管理多个batch size的CUDA图。"""
+    """CUDA 图（CUDA Graph）捕获和执行器，用于管理和调度多个常用 Batch Size 的 CUDA 图。
+    通过预先录制 GPU 算子执行序列，消除 CPU 提交任务的开销，极大地加速大模型在 Decode（生成）阶段的前向传播。
+    """
 
     def __init__(
         self,
@@ -98,28 +100,49 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
     ) -> None:
-        """初始化GraphRunner：确定图batch size列表并触发CUDA图捕获。"""
+        """初始化 GraphRunner：确定支持的 Batch Size 列表并触发 CUDA 图的捕获。
+        参数:
+            stream: 用于捕获和重放 CUDA 图的专用工作流。
+            device: 运行设备（GPU）。
+            model: 模型实例（例如 Transformer）。
+            attn_backend: 核心 Attention 后端（负责管理 KV Cache 寻址等）。
+            cuda_graph_bs: 显式指定的 CUDA 图 Batch Size 列表。
+            cuda_graph_max_bs: 支持的最大 Batch Size。
+            free_memory: 当前可用的显存大小（用于自动决定捕获哪些 Batch Size）。
+            max_seq_len: 支持的最大序列长度。
+            vocab_size: 词表大小（用于计算输出 Logits 占用的显存）。
+            dummy_req: 填充用的虚拟请求对象（用于拼凑 Batch）。
+        """
+        # 1. 自动或手动确定需要录制的 Batch Size 列表（例如 [1, 2, 4, 8, 16]）
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
         )
         self.attn_backend = attn_backend  # attention后端，用于图和replay的准备
-        self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0  # 最大支持图的batch size
-        self.graph_bs_list = sorted(cuda_graph_bs)  # 按升序排列的图batch size列表
-        self.dummy_req = dummy_req  # 填充用的dummy请求
+        self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0  # 录制的最大 Batch Size
+        self.graph_bs_list = sorted(cuda_graph_bs)  # 升序排列的 Batch Size 列表
+        self.dummy_req = dummy_req  # 用于 Padding 的虚拟请求
         self.stream = stream
         self.device = device
+        # 2. 执行核心的 CUDA 图捕获流程
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
-        """捕获多个batch size的CUDA图，用于加速decode阶段的前向传播。"""
+        """捕获（录制）多个 Batch Size 的 CUDA 图。
+        
+        基本原理：
+        CUDA 图要求输入/输出张量的【内存地址（指针）是固定不变的】。
+        因此，我们必须预先分配好一个“静态缓冲区（Static Buffer）”，在录制和重放时都读写这个固定的缓冲区。
+        """
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
+        # 初始化 Attention 后端的图捕获状态（如分配固定的 KV Cache 索引缓冲区）
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
+        # 清理显存碎片，确保捕获阶段有连续且干净的显存空间
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -128,8 +151,10 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
+        # 分配静态输入/输出缓冲区（Buffer），用于在重放时存放输入数据和输出的 Logits
         self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
-
+        
+        # 创建进度条（通常只在 Tensor Parallel 的主进程/主卡上显示，避免打印混乱）
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
             desc="Preparing for capturing CUDA graphs...",
