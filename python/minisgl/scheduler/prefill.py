@@ -120,6 +120,7 @@ class PrefillAdder:
         return None
 
 
+# 定义 PrefillManager 类，用于管理预填充（Prefill）阶段的请求挂起队列、显存测算与批次打包
 @dataclass
 class PrefillManager:
     """管理 prefill 阶段的请求队列和 batch 调度。"""
@@ -129,49 +130,82 @@ class PrefillManager:
     decode_manager: DecodeManager  # decode 管理器（用于获取 inflight token 数）
     pending_list: List[PendingReq] = field(default_factory=list)  # 等待调度的请求列表
 
+    # 定义 add_one_req 方法，用于将网络中新传入的用户推理任务，包装后加入本地调度等待队列中
     def add_one_req(self, req: UserMsg) -> None:
         """将用户请求加入待处理队列。"""
+        # 将请求封装成 PendingReq 数据结构，并追加在等待列表末尾
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
 
     # --- Prefill 调度 ---
+    # 定义核心调度逻辑方法 schedule_next_batch，返回 Batch 对象或 None
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         """从待处理队列中构造下一批 prefill batch。"""
+        # 如果当前没有在排队的等待请求，则直接返回 None，跳过本轮 Prefill 调度
         if len(self.pending_list) == 0:
             return None
 
+        # 考虑到当前依然在后台处于在线持续解码（In-flight Decode）中的任务开销，计算资源预留偏移
         # estimated offset due to in-flight decode
+        # 实例化批次拼装累加器（PrefillAdder），用来评估并精确裁定能装入本批次的请求数量
         adder = PrefillAdder(
+            # 传入单次前向推理中允许的最大预填充 Token 增量预算数
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.inflight_tokens,  # 为正在 decode 的请求预留资源
+            # 传入为当前解码中在线请求锁定的 K-V Cache 显存 Token 数，以预留资源，防止爆显存
+            reserved_size=self.decode_manager.inflight_tokens,
+            # 传入缓存管理器引用，用于判定 K-V 物理显存页面的可用情况
             cache_manager=self.cache_manager,
+            # 传入表管理器引用，用以判定物理行表槽位的可用数量
             table_manager=self.table_manager,
         )
+        # 初始化列表，保存本批次拼装成功的就绪请求实例
         reqs: List[Req] = []
+        # 初始化列表，保存本轮调度中因为单次处理不完而被进行分块（Chunked）拆分的等待请求状态
         chunked_list: List[PendingReq] = []
+        # 按排队顺序，遍历当前的挂起等待队列
         for pending_req in self.pending_list:
-            if req := adder.try_add_one(pending_req):  # 尝试加入请求
-                pending_req.chunked_req = None  # 清除旧 chunk 标记
+            # 尝试调用累加器的 try_add_one 接口，评估并尝试把当前挂起请求装进本批次中
+            if req := adder.try_add_one(pending_req):
+                # 如果成功加入本批次，清除该挂起请求中可能遗留的过时 chunk 标识
+                pending_req.chunked_req = None
+                # 判断累加器根据预算处理后，返回的是否是一个处于分块状态下的子请求
                 if isinstance(req, ChunkedReq):
-                    pending_req.chunked_req = req  # 保存新 chunk 供后续使用
+                    # 如果由于输入过长被自动分块，保存这一段新生成的 ChunkedReq，以便下次调度继续读取
+                    pending_req.chunked_req = req
+                    # 将这个仍有剩余 Token 待处理的挂起请求对象追加到分块暂存队列中
                     chunked_list.append(pending_req)
+                # 将这个经审核符合开销、可用于本次推理前向计算的请求加入批次的请求列表
                 reqs.append(req)
+            # 如果累加器返回 None，表示已达到最大显存物理限制、表容量或单批次的 Token 预算额度
             else:
+                # 终止遍历，本轮批次构建无法再接纳更多请求
                 break  # We cannot add more requests
+        # 如果遍历完后，发现连一个能够执行的请求都没有被筛选出来
         if len(reqs) == 0:
+            # 返回 None
             return None
-        # 更新待处理队列：先放 chunked 请求（优先处理），再放剩余的未处理请求
+        # 重新打包调度等待队列：必须优先把本轮计算尚未完全结束的分块子请求排到头部，然后再追加剩下的未曾调度的请求
         self.pending_list = chunked_list + self.pending_list[len(reqs):]
+        # 返回装载完毕的 Batch 实例，并将推理阶段标记为 "prefill"
         return Batch(reqs=reqs, phase="prefill")
 
+    # 定义 abort_req 方法，用于按 UID 在挂起等待队列中提前检索并移除指定的取消请求
     def abort_req(self, uid: int) -> Req | None:
         """中止一个待处理的请求，返回其已分配的 chunked_req（如果有）。"""
+        # 带索引遍历当前的挂起等待队列
         for i, req in enumerate(self.pending_list):
+            # 如果匹配到了要强行中止和取消的请求 UID
             if req.uid == uid:
+                # 将该请求从挂起队列中弹出删除
                 self.pending_list.pop(i)
+                # 返回该请求在等待队列中已经被部分分配的物理 chunked_req 对象（如果有的话，供后续外层安全释放其页表）
                 return req.chunked_req
+        # 如果未找到任何匹配该 UID 的请求，返回 None
         return None
 
+    # 声明只读属性修饰器
     @property
+    # 定义 runnable 属性，向外界报告当前管理器内是否仍有待处理的预填充任务
     def runnable(self) -> bool:
         """是否有待处理的 prefill 请求。"""
+        # 如果挂起队列长度大于 0，说明存在待处理任务，返回 True，否则返回 False
         return len(self.pending_list) > 0

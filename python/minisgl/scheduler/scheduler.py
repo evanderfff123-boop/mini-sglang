@@ -107,6 +107,7 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.check_integrity()  # 空闲时检查缓存完整性
 
     # --- 重叠调度主循环 ---
+    # 定义重叠调度循环函数，接收上一轮正在计算的数据对象，并返回本轮新启动计算的数据对象
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
         The main loop of overlapping scheduling and execution.
@@ -114,50 +115,85 @@ class Scheduler(SchedulerIOMixin):
         It will overlap the execution of current batch and processing of last batch's results,
         which can effectively hide CPU latency and improve GPU utilization.
         """
+        # 计算当前接收消息是否需要阻塞等待
         blocking = not (
+            # 如果上一轮启动计算的数据尚在流中等待处理，则当前不应发生阻塞，应尽快往下执行以重叠时间
             last_data is not None  # don't block if we have a batch to be processed
+            # 或者当前 Prefill 队列中有就绪请求，也不应阻塞
             or self.prefill_manager.runnable
+            # 或者当前 Decode 队列中有就绪请求，也不应阻塞
             or self.decode_manager.runnable
         )
+        # 循环读取并处理接收到的网络/系统消息，根据计算出的 blocking 状态决定是否在通道无数据时挂起
         for msg in self.receive_msg(blocking=blocking):  # 接收并处理消息
+            # 逐个处理接收到的用户消息或取消指令
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch()  # 调度下一批
+        # 调度下一批待执行的请求（此时 GPU 可能仍在计算上一批，利用 CPU 空闲间隙并行做调度逻辑）
+        forward_input = self._schedule_next_batch()
+        # 初始化本轮推理的数据记录对象
         ongoing_data = None
+        # 如果新调度出了可以执行的输入批次
         if forward_input is not None:
+            # 进入底层引擎执行流的上下文管理器（将后续的前向计算命令发射到引擎流中）
             with self.engine_stream_ctx:  # run the batch in the engine's stream
+                # 让引擎计算流同步等待调度流，确保下一批次所需的元数据或张量已经搬移准备完毕
                 self.engine.stream.wait_stream(self.stream)  # 同步调度流到引擎流
+                # 在引擎流上异步启动当前批次的前向传播计算（非阻塞立即返回），并封装为 ongoing_data
                 ongoing_data = (forward_input, self._forward(forward_input))
 
+        # 核心重叠操作：在 GPU 执行当前批次前向推理的同时，CPU 同步处理并释放上一批 last_data 的采样和元数据
         self._process_last_data(last_data)  # 处理上一批的结果（与当前前向传播重叠）
+        # 返回本轮发射但尚未在 CPU 侧处理结果的 ongoing_data，它将在下一次循环中作为 last_data 传入
         return ongoing_data
 
     # --- 非重叠调度主循环 ---
     def normal_loop(self) -> None:
         """普通的非重叠调度循环，串行处理消息、调度、前向传播、结果。"""
+        # 判断当前接收消息时是否需要阻塞等待：如果当前 Prefill 和 Decode 管理器均无可运行的请求，则设为 True，否则为 False
         blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+        # 遍历从接收消息通道中获取的全部最新消息（根据计算得到的阻塞状态等待）
         for msg in self.receive_msg(blocking=blocking):
+            # 逐一解析并处理接收到的单条消息（如新请求加入、请求取消等）
             self._process_one_msg(msg)
 
+        # 调用调度算法，对队列中的就绪请求进行打包，生成下一批待前向计算的输入数据
         forward_input = self._schedule_next_batch()
+        # 初始化当前轮次的执行数据对象为 None
         ongoing_data = None
+        # 如果成功调度出有效的批次输入数据
         if forward_input is not None:
+            # 串行触发模型前向传播计算，并将输入和计算结果（logits/Future）绑定为元组存入 ongoing_data
             ongoing_data = (forward_input, self._forward(forward_input))
 
+        # 处理本轮刚刚计算完的推理数据（串行地进行采样、Token 释放、状态更新以及结果发回）
         self._process_last_data(ongoing_data)
 
+    # 这里的重叠指的是CPU和GPU是否是并行执行
+    # 使用 PyTorch 的推理模式装饰器，禁用梯度计算并减少不必要的张量历史记录，以优化内存和推理速度
     @torch.inference_mode()
+    # 定义调度器的主循环运行方法，返回类型为 NoReturn（表示该函数为无限循环，正常情况下不会主动退出）
     def run_forever(self) -> NoReturn:
         """主循环入口：根据配置选择重叠或普通模式。"""
+        # 判断全局环境配置中是否禁用了重叠（Overlap）调度模式
         if ENV.DISABLE_OVERLAP_SCHEDULING:
+            # 如果禁用了重叠调度，则通过上下文管理器切入到底层推理引擎的 CUDA 流环境中
             with self.engine_stream_ctx:
+                # 阻塞引擎流，使其等待调度流中当前排队的所有操作执行完毕，确保数据一致性
                 self.engine.stream.wait_stream(self.stream)
+                # 开启一个无限循环，以串行、同步的方式持续处理请求
                 while True:
+                    # 调用普通模式的循环函数，串行执行单次调度与前向计算
                     self.normal_loop()
+        # 如果未禁用重叠调度（即启用高吞吐的重叠流水线模式）
         else:
+            # 断言确保当前线程中 PyTorch 默认活跃的 CUDA 流确实是调度器专属流
             assert torch.cuda.current_stream() == self.stream
+            # 初始化一个过渡变量 data 为 None，用于在两次异步迭代之间传递调度元数据和状态
             data = None
+            # 开启一个无限循环，以流水线重叠的方式持续进行并发调度与计算
             while True:
+                # 执行单次重叠模式的循环逻辑，更新并在迭代间循环传递 data 数据状态
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
@@ -200,36 +236,61 @@ class Scheduler(SchedulerIOMixin):
         self.send_result(reply)  # 发送 detokenize 结果给前端
 
     # --- 消息处理 ---
+    # 定义内部方法 _process_one_msg，用于分发和处理单个后台传入的消息对象
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         """处理单个后端消息（用户请求、中止、退出等）。"""
+        # 判断消息类型是否为批量消息包（BatchBackendMsg）
         if isinstance(msg, BatchBackendMsg):
-            for msg in msg.data:  # 批量消息递归处理
+            # 遍历批量包内所封装的每一条具体的子消息对象
+            for msg in msg.data:
+                # 递归调用本方法，分别解析并处理每一个子消息
                 self._process_one_msg(msg)
+        # 判断消息类型是否为系统退出信号（ExitMsg）
         elif isinstance(msg, ExitMsg):
-            raise KeyboardInterrupt  # 退出信号
+            # 抛出 KeyboardInterrupt 异常，以此中断外层的 while True 推理主循环，实现优雅停机
+            raise KeyboardInterrupt 
+        # 判断消息类型是否为新进来的用户推理请求消息（UserMsg）
         elif isinstance(msg, UserMsg):
+            # 仅在主进程（Rank 0）上打印调试日志，记录收到用户消息的详细信息
             logger.debug_rank0("Received user msg: %s", msg)
+            # 获取用户输入 prompt 的 Token 序列长度，以及当前推理引擎能支持的最大序列长度
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+            # 计算该请求理论上最大能用于生成新 Token 的可用剩余空间长度
             max_output_len = max_seq_len - input_len
-            if max_output_len <= 0:  # 输入太长，丢弃请求
+            # 如果可用剩余长度小于等于 0，表明用户输入的 prompt 长度本身就已经超过了模型的最大承载能力
+            if max_output_len <= 0: # 输入太长，丢弃请求
+                # 打印严重警告日志，并直接返回，不将该请求加入调度队列
                 return logger.warning_rank0(
                     f"Input sequence length {input_len} exceeds {max_seq_len}, "
                     f"request {msg.uid} is dropped."
                 )
+            # 如果用户设置的生成最大 Token 数（max_tokens）超过了当前剩余的最大空间边界
             if msg.sampling_params.max_tokens > max_output_len:  # 调整 max_tokens 避免溢出
+                # 将该请求的目标生成长度强制限制收缩为安全的边界最大值，防止显存越界或计算溢出
                 msg.sampling_params.max_tokens = max_output_len
+                # 在主进程上打印警告日志，提示由于物理上限，生成长度已被自适应调整
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            self.prefill_manager.add_one_req(msg)  # 加入 prefill 队列
+            # 校验并调整完参数后，将请求加入到 Prefill 管理器的等待队列中
+            self.prefill_manager.add_one_req(msg)
+        # 判断消息类型是否为中途中止当前请求的控制消息（AbortBackendMsg）
         elif isinstance(msg, AbortBackendMsg):
+            # 在主进程上打印调试日志，记录准备强制终止的请求 ID
             logger.debug_rank0("Aborting request %d", msg.uid)
-            req_to_free = self.prefill_manager.abort_req(msg.uid)  # 从 prefill 队列中止
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)  # 或从 decode 中止
+            # 尝试调用 Prefill 管理器的中止接口，寻找并移除该请求，成功则返回对应请求对象
+            req_to_free = self.prefill_manager.abort_req(msg.uid)
+            # 如果在 Prefill 队列没找到该请求，则继续尝试在 Decode 管理器中查找并移出该请求
+            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            # 如果在以上任意阶段成功定位并拦截到了待释放的请求
             if req_to_free is not None:
-                self._free_req_resources(req_to_free)  # 释放资源
+                # 调用显存与表槽位回收接口，立即释放该请求之前占用的所有物理显存页和表索引资源
+                self._free_req_resources(req_to_free)
+        # 如果收到其他未知或未定义的消息类型
         else:
+            # 记录严重错误日志，并输出未知消息的实际类名称
             logger.error(f"Unknown message type: {type(msg)}")
+            # 抛出未实现异常，阻止程序带故障继续运行
             raise NotImplementedError
 
     # --- 释放请求资源 ---
@@ -256,22 +317,34 @@ class Scheduler(SchedulerIOMixin):
         )
 
     # --- 调度下一批 ---
+    # 定义内部方法 _schedule_next_batch，用于生成下一个要在 GPU 上执行的批次输入，可返回 ForwardInput 或 Non
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        # 待办事项：未来支持其他的调度策略，例如优先调度已经处于 DECODE 状态下的请求
         batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)  # 优先调度 prefill
-            or self.decode_manager.schedule_next_batch()  # 无 prefill 则调度 decode
+            # 默认优先调度 Prefill 管理器中的请求，并限制单次计算的最大 Token 预算
+            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            # 如果本轮没有符合条件的 Prefill 请求，则顺延调度处于 Decode 管理器中的就绪请求
+            or self.decode_manager.schedule_next_batch()
         )
+        # 如果成功组合出了待推理的批次对象，则调用 _prepare_batch 进行页表和张量打包并返回，否则返回 None
         return self._prepare_batch(batch) if batch else None
 
     # --- 前向传播 ---
+    # 定义前向传播处理方法 _forward，接收准备好的输入包，并返回推理引擎输出结果对象
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         """执行一次前向传播：读取 token 池 -> 模型推理 -> 写回 token 池。"""
+        # 解构输入包，分别提取当前批次对象、采样超参数、输入内存映射索引和输出内存映射索引
         batch, sample_args, input_mapping, output_mapping = forward_input
-        batch.input_ids = self.token_pool[input_mapping]  # 从 token 池读取输入
-        forward_output = self.engine.forward_batch(batch, sample_args)  # 模型前向
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu  # 将输出写回 token 池
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)  # 更新 decode 集合
+        # 通过输入索引映射，从物理 Token 池中精准提取本轮推理所需的全部 Token ID
+        batch.input_ids = self.token_pool[input_mapping]
+        # 调用底层推理引擎的 forward_batch 方法，驱动模型在 GPU 上进行前向计算和 Token 采样
+        forward_output = self.engine.forward_batch(batch, sample_args)
+        # 将本次推理新采样出的 Token 数据，根据输出索引映射写回到物理 Token 池对应的槽位上
+        self.token_pool[output_mapping] = forward_output.next_tokens_gpu 
+        # 通知并更新 Decode 管理器的状态，筛选出本次推理后依然处于解码生命周期中的请求
+        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        # 将包含推理结果和生成的 forward_output 对象返回给调用者
         return forward_output
 
 
